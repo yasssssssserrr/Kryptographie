@@ -1,0 +1,208 @@
+
+import javax.crypto.*;
+import javax.crypto.spec.SecretKeySpec;
+import java.io.*;
+import java.security.*;
+import java.security.spec.InvalidKeySpecException;
+import java.security.spec.PKCS8EncodedKeySpec;
+import java.security.spec.X509EncodedKeySpec;
+
+public class RSF {
+
+    private PublicKey pubKey;
+    private PrivateKey prvKey;
+    private final String sender;
+    private final String receiver;
+    private final String plainFileName;
+    private final String encryptedFileName;
+    private final int bufferSize;
+    private byte[] decryptedSecretKeyBytes;
+    private byte[] secretKeySignature;
+
+    public RSF(String sender, String receiver, String encryptedFileName, String plainFileName, int bufferSize) {
+        this.sender = sender;
+        this.receiver = receiver;
+        this.plainFileName = plainFileName;
+        this.encryptedFileName = encryptedFileName;
+        this.bufferSize = bufferSize;
+    }
+
+    public RSF(String sender, String receiver, String encryptedFileName, String plainFileName) {
+        this(sender, receiver, encryptedFileName, plainFileName, 1024);
+    }
+
+
+    // 3.a/b
+    public void setFileKeys(String filePath) {
+        try {
+            // Informationen aus Datei lesen
+            DataInputStream in = new DataInputStream(new FileInputStream(filePath));
+            int len = in.readInt();
+            byte[] ownerName = new byte[len];
+            in.read(ownerName);
+            len = in.readInt();
+            byte[] fileKey = new byte[len];
+            in.read(fileKey);
+
+            KeyFactory keyFac = KeyFactory.getInstance("RSA");
+            if (filePath.endsWith(".pub")) {
+                // aus dem Byte-Array koennen wir eine X.509-Schluesselspezifikation erzeugen
+                X509EncodedKeySpec x509KeySpec = new X509EncodedKeySpec(fileKey);
+
+                // nun wird aus der Spezifikation wieder abgeschlossener public key
+                // erzeugt
+                pubKey = keyFac.generatePublic(x509KeySpec);
+            } else {
+                // aus dem Byte-Array koennen wir eine X.509-Schluesselspezifikation erzeugen
+                PKCS8EncodedKeySpec Pkcs8KeySpec = new PKCS8EncodedKeySpec(fileKey);
+                // nun wird aus der Spezifikation wieder abgeschlossener public key
+                // erzeugt
+                prvKey = keyFac.generatePrivate(Pkcs8KeySpec);
+            }
+
+        } catch (IOException | NoSuchAlgorithmException | InvalidKeySpecException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    // 3.c.
+    public void readAndDecryptFile() {
+        try {
+            // Informationen aus Datei lesen
+            System.out.println("Reading encrypted file " + encryptedFileName + " ...");
+            DataInputStream in = new DataInputStream(new FileInputStream(encryptedFileName));
+
+            int len = in.readInt();
+            byte[] encryptedSecretKey = new byte[len];
+            in.read(encryptedSecretKey);
+
+            len = in.readInt();
+            secretKeySignature = new byte[len];
+            in.read(secretKeySignature);
+
+            len = in.readInt();
+            byte[] parameters = new byte[len];
+            in.read(parameters);
+
+            // geheimen Schlüssel mit dem privaten RSA-Schlüssel entschlüsseln
+            decryptedSecretKeyBytes = decryptSecretKey(encryptedSecretKey);
+            Cipher aesCipher = createAESCipher(decryptedSecretKeyBytes, parameters);
+
+            // write plain file
+            System.out.println("Writing decrypted file " + plainFileName + " ...");
+            DataOutputStream out = new DataOutputStream(new FileOutputStream(plainFileName));
+
+            byte[] inBuffer = new byte[bufferSize];
+            while ((len = in.read(inBuffer, 0, inBuffer.length)) > 0) {
+                byte[] result = aesCipher.update(inBuffer, 0, len);
+                out.write(result);
+            }
+            in.close();
+            // mit doFinal abschliessen (Rest inkl. Padding ..)
+            byte[] resultRest = aesCipher.doFinal();
+            if (resultRest.length > 0) out.write(resultRest);
+            out.close();
+
+        } catch (IOException | IllegalBlockSizeException | BadPaddingException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    // 3.d.
+    private void validateSignature() {
+        try {
+            Signature rsaSig = Signature.getInstance("SHA512withRSA");
+            rsaSig.initVerify(pubKey);
+            rsaSig.update(decryptedSecretKeyBytes);
+            boolean ok = rsaSig.verify(secretKeySignature);
+            if (ok) {
+                System.out.println("Signatur erfolgreich verifiziert!");
+            } else {
+                System.out.println("Signatur konnte nicht verifiziert werden!");
+            }
+        } catch (NoSuchAlgorithmException ex) {
+            System.out.println("Es existiert keine Implementierung fuer RSA.");
+        } catch (SignatureException ex) {
+            System.out.println("Fehler beim ueberpruefen der Signatur!");
+        } catch (InvalidKeyException ex) {
+            System.out.println("Falscher Algorithmus?");
+        }
+
+    }
+
+
+    public static byte[] concatenate(byte[] ba1, byte[] ba2) {
+        int len1 = ba1.length;
+        int len2 = ba2.length;
+        byte[] result = new byte[len1 + len2];
+
+        // Fill with first array
+        System.arraycopy(ba1, 0, result, 0, len1);
+        // Fill with second array
+        System.arraycopy(ba2, 0, result, len1, len2);
+
+        return result;
+    }
+
+    private byte[] decryptSecretKey(byte[] encryptedSecretKey) {
+        try {
+            Cipher cipher = Cipher.getInstance("RSA");
+            // Initialisierung zur Verschluesselung mit automatischer
+            // Parametererzeugung
+            cipher.init(Cipher.DECRYPT_MODE, prvKey);
+
+            byte[] processedData = cipher.update(encryptedSecretKey);
+            byte[] processedRest = new byte[0];
+            try {
+                processedRest = cipher.doFinal();
+            } catch (IllegalBlockSizeException | BadPaddingException e) {
+                e.printStackTrace();
+            }
+
+            return concatenate(processedData, processedRest);
+
+        } catch (NoSuchAlgorithmException | NoSuchPaddingException | InvalidKeyException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private Cipher createAESCipher(byte[] decryptedSecretKeyBytes, byte[] parameters) {
+        Cipher cipher;
+        try {
+            SecretKeySpec skspec = new SecretKeySpec(decryptedSecretKeyBytes, "AES");
+            AlgorithmParameters algorithmParameters = AlgorithmParameters.getInstance("AES");
+            algorithmParameters.init(parameters);
+            cipher = Cipher.getInstance("AES/CTR/NoPadding");
+            cipher.init(Cipher.DECRYPT_MODE, skspec, algorithmParameters);
+
+        } catch (NoSuchAlgorithmException | IOException | NoSuchPaddingException | InvalidKeyException |
+                 InvalidAlgorithmParameterException e) {
+            throw new RuntimeException(e);
+        }
+
+        return cipher;
+    }
+
+    public String getSender() {
+        return sender;
+    }
+
+    public String getReceiver() {
+        return receiver;
+    }
+
+
+    public static void main(String[] args) {
+
+        // perform encryption
+        RSF rsf = new RSF(args[0], args[1], args[2], args[3]);
+        String currentDir = "";
+        rsf.setFileKeys(currentDir + "\\"+ rsf.sender);
+        rsf.setFileKeys(currentDir + "\\"+rsf.receiver);
+
+        rsf.readAndDecryptFile();
+        rsf.validateSignature();
+
+    }
+
+}
